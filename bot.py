@@ -1,4 +1,3 @@
-
 """Kino bot — aiogram 3 + aiosqlite. Railway uchun tayyor."""
 import asyncio
 import html
@@ -22,6 +21,7 @@ from aiogram.types import (
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaVideo,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -53,6 +53,8 @@ VIP_REFERRAL_COUNT = int(os.getenv("VIP_REFERRAL_COUNT", "3"))
 THROTTLE_MESSAGE = float(os.getenv("THROTTLE_MESSAGE", "1.0"))
 THROTTLE_CALLBACK = float(os.getenv("THROTTLE_CALLBACK", "0.5"))
 PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "0") == "1"  # videoni uzatish/saqlashni taqiqlash
+# 1 bo'lsa adminlar ham majburiy obunadan o'tadi (obunani o'zingiz sinab ko'rish uchun)
+ADMIN_CHECK_SUB = os.getenv("ADMIN_CHECK_SUB", "0") == "1"
  
 # Kino kodi: faqat lotin harf, raqam, _ va - (1..32 belgi)
 CODE_PATTERN = r"^[A-Za-z0-9_\-]{1,32}$"
@@ -120,6 +122,15 @@ async def init_db() -> None:
             channel_id TEXT PRIMARY KEY,
             title TEXT,
             invite_link TEXT
+        )
+    """)
+    # Serial qismlari: 1-qism movies.file_id da, 2-qismdan boshlab shu jadvalda
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            movie_code TEXT,
+            part INTEGER,
+            file_id TEXT,
+            PRIMARY KEY (movie_code, part)
         )
     """)
  
@@ -221,6 +232,7 @@ async def get_statistics() -> Tuple[int, int, int, int]:
  
 async def add_movie(code: str, title: str, file_id: str, is_vip: int) -> None:
     async with _db_lock:
+        await _db.execute("DELETE FROM episodes WHERE movie_code = ?", (code,))
         await _db.execute(
             "INSERT OR REPLACE INTO movies (code, title, file_id, is_vip, views, likes, dislikes) "
             "VALUES (?, ?, ?, ?, 0, 0, 0)",
@@ -239,6 +251,41 @@ async def get_random_movie() -> Optional[Movie]:
     return await cur.fetchone()
  
  
+async def count_parts(code: str) -> int:
+    """Kinoning jami qismlari soni (oddiy kino uchun 1)."""
+    cur = await _db.execute("SELECT COUNT(*) FROM episodes WHERE movie_code = ?", (code,))
+    return 1 + (await cur.fetchone())[0]
+ 
+ 
+async def get_part_file(code: str, part: int) -> Optional[str]:
+    """Berilgan qismning file_id si (yo'q bo'lsa None)."""
+    if part < 1:
+        return None
+    if part == 1:
+        cur = await _db.execute("SELECT file_id FROM movies WHERE code = ?", (code,))
+    else:
+        cur = await _db.execute(
+            "SELECT file_id FROM episodes WHERE movie_code = ? AND part = ?", (code, part)
+        )
+    row = await cur.fetchone()
+    return row[0] if row else None
+ 
+ 
+async def add_episode(code: str, file_id: str) -> int:
+    """Kinoga keyingi qismni qo'shadi va uning raqamini qaytaradi."""
+    async with _db_lock:
+        cur = await _db.execute(
+            "SELECT COALESCE(MAX(part), 1) FROM episodes WHERE movie_code = ?", (code,)
+        )
+        part = (await cur.fetchone())[0] + 1
+        await _db.execute(
+            "INSERT INTO episodes (movie_code, part, file_id) VALUES (?, ?, ?)",
+            (code, part, file_id),
+        )
+        await _db.commit()
+        return part
+ 
+ 
 async def increment_views(code: str) -> None:
     async with _db_lock:
         await _db.execute("UPDATE movies SET views = views + 1 WHERE code = ?", (code,))
@@ -248,6 +295,7 @@ async def increment_views(code: str) -> None:
 async def delete_movie(code: str) -> bool:
     async with _db_lock:
         await _db.execute("DELETE FROM votes WHERE movie_code = ?", (code,))
+        await _db.execute("DELETE FROM episodes WHERE movie_code = ?", (code,))
         cur = await _db.execute("DELETE FROM movies WHERE code = ?", (code,))
         deleted = cur.rowcount > 0
         await _db.commit()
@@ -345,6 +393,9 @@ class AdminStates(StatesGroup):
     add_movie_title = State()
     add_movie_type = State()
     add_movie_video = State()
+    add_movie_more = State()
+    add_episode_code = State()
+    add_episode_video = State()
  
     delete_movie_code = State()
  
@@ -375,9 +426,9 @@ def admin_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="📢 Broadcast")],
-            [KeyboardButton(text="🎬 Kino qo'shish"), KeyboardButton(text="🗑 Kino o'chirish")],
-            [KeyboardButton(text="🔗 Kanal qo'shish"), KeyboardButton(text="❌ Kanal o'chirish")],
-            [KeyboardButton(text="🏠 Foydalanuvchi menyusi")],
+            [KeyboardButton(text="🎬 Kino qo'shish"), KeyboardButton(text="➕ Qism qo'shish")],
+            [KeyboardButton(text="🗑 Kino o'chirish"), KeyboardButton(text="🔗 Kanal qo'shish")],
+            [KeyboardButton(text="❌ Kanal o'chirish"), KeyboardButton(text="🏠 Foydalanuvchi menyusi")],
         ],
         resize_keyboard=True,
     )
@@ -395,11 +446,32 @@ def sub_channels_kb(channels: List[tuple]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
  
  
-def movie_action_kb(code: str, likes: int, dislikes: int) -> InlineKeyboardMarkup:
+def movie_action_kb(
+    code: str, likes: int, dislikes: int, total: int = 1, current: int = 1
+) -> InlineKeyboardMarkup:
+    rows = []
+    if total > 1:
+        buttons = [
+            InlineKeyboardButton(
+                text=(f"▶️ {n}" if n == current else str(n)),
+                callback_data=f"part:{code}:{n}",
+            )
+            for n in range(1, total + 1)
+        ]
+        for i in range(0, len(buttons), 5):
+            rows.append(buttons[i:i + 5])
+    rows.append([
+        InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"vote:like:{code}:{current}"),
+        InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"vote:dislike:{code}:{current}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+ 
+ 
+def more_parts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text=f"👍 {likes}", callback_data=f"vote:like:{code}"),
-            InlineKeyboardButton(text=f"👎 {dislikes}", callback_data=f"vote:dislike:{code}"),
+            InlineKeyboardButton(text="➕ Yana qism qo'shish", callback_data="epadd:more"),
+            InlineKeyboardButton(text="✅ Tugatish", callback_data="epadd:done"),
         ]]
     )
  
@@ -590,14 +662,76 @@ async def process_movie_type(callback: CallbackQuery, state: FSMContext):
 async def process_movie_video(message: Message, state: FSMContext):
     data = await state.get_data()
     await add_movie(data["code"], data["title"], message.video.file_id, data["is_vip"])
-    await state.clear()
+    await state.set_state(AdminStates.add_movie_more)  # ma'lumotlar (kod va h.k.) saqlanib qoladi
     vip_text = "👑 VIP" if data["is_vip"] == 1 else "🟢 Oddiy"
     await message.answer(
-        f"✅ <b>Kino muvaffaqiyatli qo'shildi!</b>\n\n"
+        f"✅ <b>Kino qo'shildi (1-qism saqlandi)!</b>\n\n"
         f"🔢 Kod: <code>{esc(data['code'])}</code>\n"
         f"🎬 Nomi: {esc(data['title'])}\n"
-        f"🔖 Holati: {vip_text}",
-        reply_markup=admin_menu_kb(),
+        f"🔖 Holati: {vip_text}\n\n"
+        "📺 Serial bo'lsa, yana qism qo'shing. Bitta kino bo'lsa «✅ Tugatish» ni bosing:",
+        reply_markup=more_parts_kb(),
+    )
+ 
+ 
+@admin_router.callback_query(AdminStates.add_movie_more, F.data == "epadd:more")
+async def episode_more(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    next_part = await count_parts(data["code"]) + 1
+    await state.set_state(AdminStates.add_episode_video)
+    await callback.message.edit_text(f"📹 <b>{next_part}-qism videosini yuboring:</b>")
+    await callback.answer()
+ 
+ 
+@admin_router.callback_query(AdminStates.add_movie_more, F.data == "epadd:done")
+async def episode_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    total = await count_parts(data["code"])
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ <b>Tayyor!</b> <code>{esc(data['code'])}</code> kodli kino — jami <b>{total} qism</b>."
+    )
+    await callback.message.answer("👨‍💻 Admin menyu:", reply_markup=admin_menu_kb())
+    await callback.answer()
+ 
+ 
+@admin_router.message(AdminStates.add_episode_video, F.video)
+async def process_episode_video(message: Message, state: FSMContext):
+    data = await state.get_data()
+    part = await add_episode(data["code"], message.video.file_id)
+    await state.set_state(AdminStates.add_movie_more)
+    await message.answer(
+        f"✅ <b>{part}-qism saqlandi!</b> Yana qism qo'shasizmi?", reply_markup=more_parts_kb()
+    )
+ 
+ 
+@admin_router.message(AdminStates.add_episode_video)
+async def process_episode_video_invalid(message: Message):
+    await message.answer("⚠️ <b>Iltimos, faqat video fayl yuboring!</b>")
+ 
+ 
+# --- Mavjud kinoga keyinroq qism qo'shish ---
+@admin_router.message(F.text == "➕ Qism qo'shish")
+async def start_add_episode(message: Message, state: FSMContext):
+    await state.set_state(AdminStates.add_episode_code)
+    await message.answer(
+        "🔢 <b>Qaysi kinoga qism qo'shmoqchisiz? Kino kodini kiriting:</b>", reply_markup=cancel_kb()
+    )
+ 
+ 
+@admin_router.message(AdminStates.add_episode_code, F.text)
+async def process_episode_code(message: Message, state: FSMContext):
+    code = message.text.strip()
+    movie = await get_movie(code)
+    if not movie:
+        await message.answer(f"❌ <code>{esc(code)}</code> kodli kino topilmadi. Qaytadan kiriting:")
+        return
+    total = await count_parts(code)
+    await state.update_data(code=code)
+    await state.set_state(AdminStates.add_episode_video)
+    await message.answer(
+        f"🎬 <b>{esc(movie[1])}</b> hozir <b>{total} qism</b>dan iborat.\n"
+        f"📹 <b>{total + 1}-qism videosini yuboring:</b>"
     )
  
  
@@ -783,6 +917,7 @@ async def process_channel_link(message: Message, state: FSMContext):
     StateFilter(
         AdminStates.add_movie_code,
         AdminStates.add_movie_title,
+        AdminStates.add_episode_code,
         AdminStates.delete_movie_code,
         AdminStates.add_channel_id,
         AdminStates.add_channel_title,
@@ -844,7 +979,7 @@ async def _check_one(bot: Bot, channel: tuple, user_id: int) -> Optional[tuple]:
  
  
 async def get_unsubscribed_channels(bot: Bot, user_id: int) -> List[tuple]:
-    if user_id in ADMIN_IDS:
+    if user_id in ADMIN_IDS and not ADMIN_CHECK_SUB:
         return []
     channels = await get_channels()
     if not channels:
@@ -877,38 +1012,51 @@ async def notify_referral(bot: Bot, user_id: int) -> None:
         pass
  
  
+async def _vip_locked(user_id: int, is_vip: int) -> Optional[int]:
+    """VIP yopiq bo'lsa foydalanuvchining referallar sonini, ochiq bo'lsa None qaytaradi."""
+    if is_vip != 1 or user_id in ADMIN_IDS:
+        return None
+    refs = await get_user_referrals(user_id)
+    return refs if refs < VIP_REFERRAL_COUNT else None
+ 
+ 
+def build_caption(movie: Movie, bot_username: str, part: int, total: int) -> str:
+    code, title, _file_id, is_vip, views, _likes, _dislikes = movie
+    stats_line = f"👁 Ko'rishlar: <b>{views}</b>"
+    if is_vip == 1:
+        stats_line += " | 👑 VIP"
+    part_line = f"📺 Qism: <b>{part} / {total}</b>\n" if total > 1 else ""
+    return (
+        f"🎬 <b>{esc(title)}</b>\n\n"
+        f"🔢 Kino kodi: <code>{esc(code)}</code>\n"
+        f"{part_line}"
+        f"{stats_line}\n\n"
+        f"🤖 Bizning bot: @{bot_username}"
+    )
+ 
+ 
 async def send_movie_helper(message: Message, movie: Movie, bot: Bot, user_id: int) -> None:
     code, title, file_id, is_vip, views, likes, dislikes = movie
     bot_info = await bot.me()
  
-    if is_vip == 1 and user_id not in ADMIN_IDS:
-        refs = await get_user_referrals(user_id)
-        if refs < VIP_REFERRAL_COUNT:
-            ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-            await message.answer(
-                f"👑 <b>«{esc(title)}» — VIP kino hisoblanadi!</b>\n\n"
-                f"VIP kinolarni ko'rish uchun botga <b>{VIP_REFERRAL_COUNT} ta do'stingizni</b> taklif qilishingiz kerak.\n\n"
-                f"👥 Siz taklif qilganlar: <b>{refs} / {VIP_REFERRAL_COUNT} ta</b>\n"
-                f"🔗 Sizning referal havolangiz:\n<code>{ref_link}</code>"
-            )
-            return  # VIP yopiq bo'lsa ko'rishlar soni oshmaydi
+    refs = await _vip_locked(user_id, is_vip)
+    if refs is not None:
+        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+        await message.answer(
+            f"👑 <b>«{esc(title)}» — VIP kino hisoblanadi!</b>\n\n"
+            f"VIP kinolarni ko'rish uchun botga <b>{VIP_REFERRAL_COUNT} ta do'stingizni</b> taklif qilishingiz kerak.\n\n"
+            f"👥 Siz taklif qilganlar: <b>{refs} / {VIP_REFERRAL_COUNT} ta</b>\n"
+            f"🔗 Sizning referal havolangiz:\n<code>{ref_link}</code>"
+        )
+        return  # VIP yopiq bo'lsa ko'rishlar soni oshmaydi
  
-    await increment_views(code)
-    views += 1
- 
-    stats_line = f"👁 Ko'rishlar: <b>{views}</b>"
-    if is_vip == 1:
-        stats_line += " | 👑 VIP"
-    caption = (
-        f"🎬 <b>{esc(title)}</b>\n\n"
-        f"🔢 Kino kodi: <code>{esc(code)}</code>\n"
-        f"{stats_line}\n\n"
-        f"🤖 Bizning bot: @{bot_info.username}"
-    )
+    await increment_views(code)  # ko'rish faqat kino ochilganda sanaladi (qism almashtirishda emas)
+    movie = (code, title, file_id, is_vip, views + 1, likes, dislikes)
+    total = await count_parts(code)
     await message.answer_video(
         video=file_id,
-        caption=caption,
-        reply_markup=movie_action_kb(code, likes, dislikes),
+        caption=build_caption(movie, bot_info.username, 1, total),
+        reply_markup=movie_action_kb(code, likes, dislikes, total, 1),
         protect_content=PROTECT_CONTENT,
     )
  
@@ -1028,13 +1176,52 @@ async def menu_top_movies(message: Message, state: FSMContext, bot: Bot):
     await message.answer(text)
  
  
-@user_router.callback_query(F.data.startswith("vote:"))
-async def handle_movie_vote(callback: CallbackQuery):
-    parts = callback.data.split(":", 2)
-    if len(parts) != 3 or parts[1] not in ("like", "dislike"):
+@user_router.callback_query(F.data.startswith("part:"))
+async def handle_part_switch(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
         await callback.answer()
         return
-    _, vote_type, code = parts
+    code, part = parts[1], int(parts[2])
+ 
+    movie = await get_movie(code)
+    if not movie:
+        await callback.answer("❌ Bu kino endi mavjud emas.", show_alert=True)
+        return
+    if await get_unsubscribed_channels(bot, callback.from_user.id):
+        await callback.answer("❗️ Avval kanallarga obuna bo'ling va /start bosing.", show_alert=True)
+        return
+    if await _vip_locked(callback.from_user.id, movie[3]) is not None:
+        await callback.answer("👑 Bu VIP kino. Ko'rish uchun do'stlaringizni taklif qiling.", show_alert=True)
+        return
+ 
+    total = await count_parts(code)
+    file_id = await get_part_file(code, part)
+    if not file_id or part > total:
+        await callback.answer("❌ Bunday qism topilmadi.", show_alert=True)
+        return
+ 
+    bot_info = await bot.me()
+    try:
+        await callback.message.edit_media(
+            media=InputMediaVideo(
+                media=file_id, caption=build_caption(movie, bot_info.username, part, total)
+            ),
+            reply_markup=movie_action_kb(code, movie[5], movie[6], total, part),
+        )
+    except TelegramBadRequest:
+        pass  # shu qismning o'zi bosilganda Telegram "message is not modified" deydi
+    await callback.answer()
+ 
+ 
+@user_router.callback_query(F.data.startswith("vote:"))
+async def handle_movie_vote(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    if len(parts) not in (3, 4) or parts[1] not in ("like", "dislike"):
+        await callback.answer()
+        return
+    vote_type, code = parts[1], parts[2]
+    current = int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else 1
  
     status, likes, dislikes = await vote_movie(callback.from_user.id, code, vote_type)
     if status == "missing":
@@ -1044,8 +1231,11 @@ async def handle_movie_vote(callback: CallbackQuery):
         await callback.answer("⚠️ Siz allaqachon ushbu ovozni bergansiz!")
         return
  
+    total = await count_parts(code)
     try:
-        await callback.message.edit_reply_markup(reply_markup=movie_action_kb(code, likes, dislikes))
+        await callback.message.edit_reply_markup(
+            reply_markup=movie_action_kb(code, likes, dislikes, total, current)
+        )
     except TelegramBadRequest:
         pass
     await callback.answer("✅ Ovozingiz qabul qilindi!")
