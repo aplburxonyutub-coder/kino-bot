@@ -1,11 +1,20 @@
-"""Kino bot — aiogram 3 + aiosqlite. Railway uchun tayyor."""
+"""Kino bot — aiogram 3 + aiosqlite. Railway uchun tayyor.
+
+Yangi imkoniyatlar:
+  1) Kino NOMI bo'yicha matnli qidiruv (katta-kichik harfga va apostrof turiga bog'liq emas).
+  2) AI (Gemini Vision) orqali kinoni aniqlash: Instagram Reels havolasi, video yoki skrinshot.
+     Oddiy foydalanuvchilar uchun kunlik limit (standart: 3 ta).
+"""
 import asyncio
 import html
+import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -27,6 +36,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     TelegramObject,
 )
+from pydantic import BaseModel
 
 try:  # lokal ishlatishda .env faylini o'qish (Railway'da shart emas)
     from dotenv import load_dotenv
@@ -46,6 +56,10 @@ def _int_list(value: str) -> List[int]:
     return [int(x) for x in value.replace(" ", "").split(",") if x.lstrip("-").isdigit()]
 
 
+def _str_list(value: str) -> List[str]:
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = _int_list(os.getenv("ADMIN_IDS", ""))
 DB_PATH = os.getenv("DB_PATH", "kino_bot.db")  # Railway'da: /data/kino_bot.db (Volume)
@@ -56,10 +70,70 @@ PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "0") == "1"  # videoni uzatish/sa
 # 1 bo'lsa adminlar ham majburiy obunadan o'tadi (obunani o'zingiz sinab ko'rish uchun)
 ADMIN_CHECK_SUB = os.getenv("ADMIN_CHECK_SUB", "0") == "1"
 
+# --- AI qidiruv sozlamalari ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Eslatma: gemini-1.5-* modellari Google tomonidan o'chirilgan. Model nomini Railway Variables'da
+# GEMINI_MODEL orqali almashtirish mumkin (kod o'zgarmaydi). Birinchisi ishlamasa, keyingilari sinab ko'riladi.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_FALLBACK_MODELS = _str_list(os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash-lite"))
+AI_DAILY_LIMIT_FREE = int(os.getenv("AI_DAILY_LIMIT_FREE", "3"))  # oddiy foydalanuvchi, kuniga
+AI_DAILY_LIMIT_VIP = int(os.getenv("AI_DAILY_LIMIT_VIP", "20"))  # VIP (referal) foydalanuvchi; 0 = cheksiz
+AI_MAX_PARALLEL = int(os.getenv("AI_MAX_PARALLEL", "2"))  # bir vaqtda nechta yuklash/kadr kesish jarayoni
+MAX_REEL_MB = int(os.getenv("MAX_REEL_MB", "50"))  # Instagram videosi uchun maksimal hajm
+# Instagram ko'p hollarda serverlardan kirishni bloklaydi. Kerak bo'lsa cookies.txt (Netscape format) yo'li:
+INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip()
+MAX_TG_DOWNLOAD = 20 * 1024 * 1024  # Telegram Bot API faqat 20 MB gacha faylni yuklab berishga ruxsat beradi
+SEARCH_RESULTS_LIMIT = 8  # nom bo'yicha qidiruvda ko'rsatiladigan maksimal tugmalar soni
+
+# Kunlik limit O'zbekiston vaqti (UTC+5) bilan yangilanadi (Railway serveri UTC'da ishlaydi)
+UZ_TZ = timezone(timedelta(hours=5))
+
 # Kino kodi: faqat lotin harf, raqam, _ va - (1..32 belgi)
 CODE_PATTERN = r"^[A-Za-z0-9_\-]{1,32}$"
+# Instagram havolasi (reel / post / tv)
+IG_URL_RE = re.compile(
+    r"https?://(?:www\.|m\.)?(?:instagram\.com|instagr\.am)/(?:[A-Za-z0-9_.]+/)?(?:reels?|p|tv)/[A-Za-z0-9_\-]+[^\s]*",
+    re.IGNORECASE,
+)
+
+NOT_FOUND_TEXT = (
+    "Kechirasiz, bu nomdagi kino topilmadi. Kino kodini kiritib ko'ring yoki nomini to'g'ri yozganingizni tekshiring."
+)
 
 esc = html.escape
+
+
+def _today_uz() -> str:
+    return datetime.now(UZ_TZ).date().isoformat()
+
+
+def _first_line(text: str, limit: int = 100) -> str:
+    line = (text or "").strip().split("\n")[0]
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _clip(text: str, limit: int = 800) -> str:
+    """Telegram sarlavhasi 1024 belgidan oshmasligi uchun uzun matnni qisqartiradi."""
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def normalize_text(text: Optional[str]) -> str:
+    """Qidiruv uchun matnni bir xil ko'rinishga keltiradi:
+    kichik harf (kirill/lotin hammasi uchun), apostroflar olib tashlanadi (o', o‘, oʻ -> o),
+    tinish belgilari bo'sh joyga aylanadi. SQLite'ning LIKE'i ASCII'dan boshqa harflarda katta-kichikni
+    ajratadi, shuning uchun qidiruv shu normallashtirilgan ustunda olib boriladi."""
+    text = (text or "").casefold()
+    for ch in "'`’‘ʻʼ´ʹ":
+        text = text.replace(ch, "")
+    text = re.sub(r"[\W_]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def build_search_text(title: str, original_title: Optional[str]) -> str:
+    """Qidiriladigan matn: sarlavhaning 1-qatori (kino nomi) + original nomi."""
+    return normalize_text(f"{_first_line(title, 200)} {original_title or ''}")
+
 
 # =====================================================================
 # 2. MA'LUMOTLAR BAZASI (bitta umumiy ulanish + WAL + lock)
@@ -107,7 +181,9 @@ async def init_db() -> None:
             views INTEGER DEFAULT 0,
             likes INTEGER DEFAULT 0,
             dislikes INTEGER DEFAULT 0,
-            poster_id TEXT
+            poster_id TEXT,
+            original_title TEXT,
+            search_text TEXT
         )
     """)
     await _db.execute("""
@@ -134,6 +210,15 @@ async def init_db() -> None:
             PRIMARY KEY (movie_code, part)
         )
     """)
+    # AI qidiruvning kunlik hisobi
+    await _db.execute("""
+        CREATE TABLE IF NOT EXISTS ai_usage (
+            user_id INTEGER,
+            day TEXT,
+            used INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, day)
+        )
+    """)
 
     # Eski bazani yangilash (migratsiya)
     cols = await _columns("users")
@@ -143,8 +228,27 @@ async def init_db() -> None:
         await _db.execute("UPDATE users SET referral_counted = 1 WHERE invited_by IS NOT NULL")
     if "is_active" not in cols:
         await _db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
-    if "poster_id" not in await _columns("movies"):
+
+    mcols = await _columns("movies")
+    if "poster_id" not in mcols:
         await _db.execute("ALTER TABLE movies ADD COLUMN poster_id TEXT")
+    if "original_title" not in mcols:
+        await _db.execute("ALTER TABLE movies ADD COLUMN original_title TEXT")
+    if "search_text" not in mcols:
+        await _db.execute("ALTER TABLE movies ADD COLUMN search_text TEXT")
+
+    # Eski kinolar uchun qidiruv matnini to'ldirish
+    cur = await _db.execute("SELECT code, title, original_title FROM movies WHERE search_text IS NULL")
+    rows = await cur.fetchall()
+    if rows:
+        await _db.executemany(
+            "UPDATE movies SET search_text = ? WHERE code = ?",
+            [(build_search_text(title, orig), code) for code, title, orig in rows],
+        )
+
+    # 14 kundan eski AI hisoblarini tozalash
+    old_day = (datetime.now(UZ_TZ).date() - timedelta(days=14)).isoformat()
+    await _db.execute("DELETE FROM ai_usage WHERE day < ?", (old_day,))
 
     await _db.commit()
 
@@ -233,15 +337,33 @@ async def get_statistics() -> Tuple[int, int, int, int]:
     return total, active, today_users, movies
 
 
-async def add_movie(code: str, title: str, file_id: str, is_vip: int) -> None:
+async def add_movie(
+    code: str, title: str, file_id: str, is_vip: int, original_title: Optional[str] = None
+) -> None:
     async with _db_lock:
         await _db.execute("DELETE FROM episodes WHERE movie_code = ?", (code,))
         await _db.execute(
-            "INSERT OR REPLACE INTO movies (code, title, file_id, is_vip, views, likes, dislikes) "
-            "VALUES (?, ?, ?, ?, 0, 0, 0)",
-            (code, title, file_id, is_vip),
+            "INSERT OR REPLACE INTO movies "
+            "(code, title, file_id, is_vip, views, likes, dislikes, original_title, search_text) "
+            "VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)",
+            (code, title, file_id, is_vip, original_title, build_search_text(title, original_title)),
         )
         await _db.commit()
+
+
+async def set_original_title(code: str, original_title: str) -> bool:
+    """Mavjud kinoning original nomini o'rnatadi va qidiruv matnini yangilaydi."""
+    async with _db_lock:
+        cur = await _db.execute("SELECT title FROM movies WHERE code = ?", (code,))
+        row = await cur.fetchone()
+        if not row:
+            return False
+        await _db.execute(
+            "UPDATE movies SET original_title = ?, search_text = ? WHERE code = ?",
+            (original_title, build_search_text(row[0], original_title), code),
+        )
+        await _db.commit()
+        return True
 
 
 async def get_movie(code: str) -> Optional[Movie]:
@@ -252,6 +374,35 @@ async def get_movie(code: str) -> Optional[Movie]:
 async def get_random_movie() -> Optional[Movie]:
     cur = await _db.execute(f"SELECT {MOVIE_COLS} FROM movies ORDER BY RANDOM() LIMIT 1")
     return await cur.fetchone()
+
+
+async def search_movies(query: str, limit: int = SEARCH_RESULTS_LIMIT) -> List[Movie]:
+    """Nom bo'yicha qidiruv (LIKE %so'z%). Barcha so'zlar bo'lishi kerak (tartib muhim emas);
+    butun ibora to'liq mos kelganlar va ko'p ko'rilganlar yuqoriga chiqadi."""
+    norm = normalize_text(query)
+    if len(norm) < 2:
+        return []
+    words = norm.split()[:6]
+    where = " AND ".join("search_text LIKE ?" for _ in words)
+    params: List[Any] = [f"%{w}%" for w in words]
+    cur = await _db.execute(
+        f"SELECT {MOVIE_COLS} FROM movies WHERE {where} "
+        f"ORDER BY (search_text LIKE ?) DESC, views DESC LIMIT ?",
+        (*params, f"%{norm}%", limit),
+    )
+    return await cur.fetchall()
+
+
+async def search_movies_multi(queries: List[str], limit: int = SEARCH_RESULTS_LIMIT) -> List[Movie]:
+    """Bir nechta nom variantlari (original / o'zbekcha) bo'yicha qidirib, takrorlarsiz birlashtiradi."""
+    seen: set = set()
+    out: List[Movie] = []
+    for q in queries:
+        for movie in await search_movies(q, limit):
+            if movie[0] not in seen:
+                seen.add(movie[0])
+                out.append(movie)
+    return out[:limit]
 
 
 async def set_poster(code: str, poster_id: Optional[str]) -> None:
@@ -394,6 +545,41 @@ async def delete_channel(channel_id: str) -> bool:
         return cur.rowcount > 0
 
 
+# --- AI qidiruv limiti ---
+
+
+async def try_consume_ai(user_id: int, limit: int) -> Tuple[bool, int]:
+    """Bitta AI urinishini ATOMIK ravishda band qiladi (bir vaqtda ko'p so'rov yuborib limitni
+    aylanib o'tib bo'lmasligi uchun). limit <= 0 — cheksiz.
+    Qaytaradi: (ruxsat berildimi, bugungi jami ishlatilgan soni)."""
+    day = _today_uz()
+    async with _db_lock:
+        cur = await _db.execute(
+            "SELECT used FROM ai_usage WHERE user_id = ? AND day = ?", (user_id, day)
+        )
+        row = await cur.fetchone()
+        used = row[0] if row else 0
+        if limit > 0 and used >= limit:
+            return False, used
+        await _db.execute(
+            "INSERT INTO ai_usage (user_id, day, used) VALUES (?, ?, 1) "
+            "ON CONFLICT(user_id, day) DO UPDATE SET used = used + 1",
+            (user_id, day),
+        )
+        await _db.commit()
+        return True, used + 1
+
+
+async def refund_ai(user_id: int) -> None:
+    """Texnik xatolik (yuklab bo'lmadi, Gemini javob bermadi) bo'lsa, urinishni qaytarib beradi."""
+    async with _db_lock:
+        await _db.execute(
+            "UPDATE ai_usage SET used = MAX(used - 1, 0) WHERE user_id = ? AND day = ?",
+            (user_id, _today_uz()),
+        )
+        await _db.commit()
+
+
 # =====================================================================
 # 3. FSM HOLATLARI
 # =====================================================================
@@ -406,6 +592,7 @@ class UserStates(StatesGroup):
 class AdminStates(StatesGroup):
     add_movie_code = State()
     add_movie_title = State()
+    add_movie_original = State()
     add_movie_type = State()
     add_movie_poster = State()
     add_movie_video = State()
@@ -486,6 +673,15 @@ def movie_action_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def search_results_kb(movies: List[Movie]) -> InlineKeyboardMarkup:
+    """Nom bo'yicha topilgan bir nechta kinodan birini tanlash tugmalari."""
+    rows = []
+    for code, title, _file_id, is_vip, _views, _likes, _dislikes in movies:
+        label = ("👑 " if is_vip else "🎬 ") + _first_line(title, 50)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"movie:{code}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def more_parts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -498,6 +694,12 @@ def more_parts_kb() -> InlineKeyboardMarkup:
 def poster_skip_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="poster:skip")]]
+    )
+
+
+def original_skip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="orig:skip")]]
     )
 
 
@@ -616,6 +818,23 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 
+@admin_router.message(Command("orig"))
+async def cmd_set_original(message: Message, command: CommandObject):
+    """/orig KOD Original nomi — mavjud kinoga original nom qo'shish (AI qidiruv aniqroq ishlashi uchun)."""
+    parts = (command.args or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer(
+            "ℹ️ Foydalanish: <code>/orig KOD Original nomi</code>\n"
+            "Masalan: <code>/orig 105 Avengers: Endgame</code>"
+        )
+        return
+    code, original = parts[0], parts[1].strip()
+    if await set_original_title(code, original):
+        await message.answer(f"✅ <code>{esc(code)}</code> kinosining original nomi saqlandi: <b>{esc(original)}</b>")
+    else:
+        await message.answer(f"❌ <code>{esc(code)}</code> kodli kino topilmadi.")
+
+
 @admin_router.message(F.text == "🏠 Foydalanuvchi menyusi")
 async def back_to_user_menu(message: Message, state: FSMContext):
     await state.clear()
@@ -665,14 +884,35 @@ async def process_movie_code(message: Message, state: FSMContext):
 
     await state.update_data(code=code)
     await state.set_state(AdminStates.add_movie_title)
-    await message.answer("📝 <b>Kino nomini va qisqacha ma'lumotini kiriting:</b>")
+    await message.answer(
+        "📝 <b>Kino nomini va qisqacha ma'lumotini kiriting:</b>\n"
+        "<i>Kino nomi birinchi qatorda bo'lsin — nom bo'yicha qidiruv shu qatordan qidiradi.</i>"
+    )
 
 
 @admin_router.message(AdminStates.add_movie_title, F.text)
 async def process_movie_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
+    await state.set_state(AdminStates.add_movie_original)
+    await message.answer(
+        "🌐 <b>Kinoning original (asl) nomini kiriting</b> (masalan: <code>Avengers: Endgame</code>).\n"
+        "AI qidiruv kinoni aniqroq topishi uchun tavsiya etiladi, o'tkazib yuborsangiz ham bo'ladi:",
+        reply_markup=original_skip_kb(),
+    )
+
+
+@admin_router.message(AdminStates.add_movie_original, F.text)
+async def process_movie_original(message: Message, state: FSMContext):
+    await state.update_data(original_title=message.text.strip())
     await state.set_state(AdminStates.add_movie_type)
     await message.answer("👑 <b>Kino turini tanlang:</b>", reply_markup=movie_type_kb())
+
+
+@admin_router.callback_query(AdminStates.add_movie_original, F.data == "orig:skip")
+async def skip_movie_original(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.add_movie_type)
+    await callback.message.edit_text("👑 <b>Kino turini tanlang:</b>", reply_markup=movie_type_kb())
+    await callback.answer()
 
 
 @admin_router.callback_query(AdminStates.add_movie_type, F.data.startswith("mtype:"))
@@ -710,16 +950,20 @@ async def process_movie_poster_invalid(message: Message):
 @admin_router.message(AdminStates.add_movie_video, F.video)
 async def process_movie_video(message: Message, state: FSMContext):
     data = await state.get_data()
-    await add_movie(data["code"], data["title"], message.video.file_id, data["is_vip"])
+    await add_movie(
+        data["code"], data["title"], message.video.file_id, data["is_vip"], data.get("original_title")
+    )
     if data.get("poster_id"):
         await set_poster(data["code"], data["poster_id"])
     await state.set_state(AdminStates.add_movie_more)  # ma'lumotlar (kod va h.k.) saqlanib qoladi
     vip_text = "👑 VIP" if data["is_vip"] == 1 else "🟢 Oddiy"
     poster_text = "bor" if data.get("poster_id") else "yo'q"
+    original_line = f"🌐 Original nomi: {esc(data['original_title'])}\n" if data.get("original_title") else ""
     await message.answer(
         f"✅ <b>Kino qo'shildi (1-qism saqlandi)!</b>\n\n"
         f"🔢 Kod: <code>{esc(data['code'])}</code>\n"
         f"🎬 Nomi: {esc(data['title'])}\n"
+        f"{original_line}"
         f"🔖 Holati: {vip_text}\n"
         f"🖼 Video ustidagi rasm: {poster_text}\n\n"
         "📺 Serial bo'lsa, yana qism qo'shing. Bitta kino bo'lsa «✅ Tugatish» ni bosing:",
@@ -1004,6 +1248,7 @@ async def process_channel_link(message: Message, state: FSMContext):
     StateFilter(
         AdminStates.add_movie_code,
         AdminStates.add_movie_title,
+        AdminStates.add_movie_original,
         AdminStates.add_episode_code,
         AdminStates.add_poster_code,
         AdminStates.delete_movie_code,
@@ -1108,17 +1353,6 @@ async def _vip_locked(user_id: int, is_vip: int) -> Optional[int]:
     return refs if refs < VIP_REFERRAL_COUNT else None
 
 
-def _first_line(text: str, limit: int = 100) -> str:
-    line = (text or "").strip().split("\n")[0]
-    return line if len(line) <= limit else line[: limit - 1] + "…"
-
-
-def _clip(text: str, limit: int = 800) -> str:
-    """Telegram sarlavhasi 1024 belgidan oshmasligi uchun uzun matnni qisqartiradi."""
-    text = text or ""
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 def build_caption(movie: Movie, bot_username: str, part: int, total: int) -> str:
     code, title, _file_id, is_vip, views, _likes, _dislikes = movie
     stats_line = f"👁 Ko'rishlar: <b>{views}</b>"
@@ -1190,7 +1424,9 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, state: F
     await notify_referral(bot, user_id)
     await message.answer(
         f"👋 Assalomu alaykum, <b>{esc(message.from_user.full_name)}</b>!\n\n"
-        "🎬 Kino topish uchun kino kodini yuboring yoki quyidagi menyudan foydalaning:",
+        "🎬 Kino topish uchun <b>kino kodini</b> yoki <b>nomini</b> yuboring.\n"
+        "🤖 Kino nomini bilmasangiz — Instagram <b>Reels havolasi</b>, <b>video</b> yoki "
+        "<b>skrinshot</b> yuboring, AI kinoni aniqlab beradi.",
         reply_markup=main_menu_kb(),
     )
 
@@ -1212,7 +1448,7 @@ async def callback_check_subs(callback: CallbackQuery, bot: Bot):
     except TelegramBadRequest:
         pass
     await callback.message.answer(
-        "✅ <b>Obunangiz tasdiqlandi!</b>\nKino kodini yuborishingiz yoki menyudan foydalanishingiz mumkin:",
+        "✅ <b>Obunangiz tasdiqlandi!</b>\nKino kodini yoki nomini yuborishingiz yoki menyudan foydalanishingiz mumkin:",
         reply_markup=main_menu_kb(),
     )
     await callback.answer()
@@ -1224,7 +1460,10 @@ async def menu_search_movie(message: Message, state: FSMContext, bot: Bot):
     if not await require_subscription(message, bot):
         return
     await state.set_state(UserStates.waiting_for_code)
-    await message.answer("🔢 <b>Marhamat, kino kodini yuboring:</b>")
+    await message.answer(
+        "🔢 <b>Marhamat, kino kodini yoki nomini yuboring.</b>\n"
+        "🤖 Yoki Instagram Reels havolasi / video / skrinshot yuboring — AI aniqlaydi."
+    )
 
 
 @user_router.message(F.text == "🎲 Tasodifiy kino")
@@ -1360,39 +1599,529 @@ async def handle_movie_vote(callback: CallbackQuery):
     await callback.answer("✅ Ovozingiz qabul qilindi!")
 
 
-async def _search_by_code(message: Message, state: FSMContext, bot: Bot):
+@user_router.callback_query(F.data.startswith("movie:"))
+async def handle_movie_pick(callback: CallbackQuery, bot: Bot):
+    """Nom bo'yicha qidiruv (yoki AI) natijalari ro'yxatidan kino tanlash."""
+    code = callback.data.split(":", 1)[1]
+    movie = await get_movie(code)
+    if not movie:
+        await callback.answer("❌ Bu kino endi mavjud emas.", show_alert=True)
+        return
+    if await get_unsubscribed_channels(bot, callback.from_user.id):
+        await callback.answer("❗️ Avval kanallarga obuna bo'ling va /start bosing.", show_alert=True)
+        return
+    await callback.answer()
+    await send_movie_helper(callback.message, movie, bot, callback.from_user.id)
+
+
+# ---------------------------------------------------------------------
+# 8.1  NOM / KOD BO'YICHA QIDIRUV
+# ---------------------------------------------------------------------
+
+
+async def _search_by_name(
+    message: Message, bot: Bot, query: str, not_found_text: str = NOT_FOUND_TEXT
+) -> None:
+    """Nom bo'yicha qidiradi: 1 ta topilsa — darhol yuboradi, ko'p bo'lsa — tugmalar, yo'q bo'lsa — xabar."""
+    results = await search_movies(query)
+    if not results:
+        await message.answer(not_found_text)
+        return
+    if len(results) == 1:
+        await send_movie_helper(message, results[0], bot, message.from_user.id)
+        return
+    await message.answer(
+        f"🔎 «<b>{esc(_clip(query, 40))}</b>» bo'yicha <b>{len(results)} ta</b> kino topildi.\n"
+        "Keraklisini tanlang:",
+        reply_markup=search_results_kb(results),
+    )
+
+
+async def _search_text(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Oddiy matn: avval kino KODI sifatida, topilmasa — kino NOMI sifatida qidiriladi.
+    (Bir so'zli nomlar — masalan «titanic» — kod andozasiga ham mos keladi, shuning uchun
+    kod topilmasa albatta nom bo'yicha ham qidiriladi.)"""
     await state.clear()
+    text = (message.text or "").strip()
+
+    if text.startswith("/"):
+        await message.answer(
+            "🤔 Noma'lum buyruq. Kino kodini yoki nomini yuboring yoki menyudan foydalaning.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     if not await require_subscription(message, bot, "❗️ Kino olishdan oldin kanallarga obuna bo'ling:"):
         return
 
-    code = message.text.strip()
-    movie = await get_movie(code)
-    if not movie:
-        await message.answer(
-            f"❌ <code>{esc(code)}</code> kodli kino topilmadi.\n"
+    is_code_like = bool(re.match(CODE_PATTERN, text))
+    if is_code_like:
+        movie = await get_movie(text)
+        if movie:
+            await send_movie_helper(message, movie, bot, message.from_user.id)
+            return
+
+    if text.isdigit():
+        miss_text = (
+            f"❌ <code>{esc(text)}</code> kodli kino topilmadi.\n"
             "Kodni to'g'ri yozganingizga ishonch hosil qiling!"
         )
-        return
-    await send_movie_helper(message, movie, bot, message.from_user.id)
+    else:
+        miss_text = NOT_FOUND_TEXT
+    await _search_by_name(message, bot, text, miss_text)
 
 
-# Tartib muhim: yuqoridagi menyu tugmalari avval tekshiriladi, bular esa oxirida.
-@user_router.message(UserStates.waiting_for_code, F.text)
-async def search_in_waiting_state(message: Message, state: FSMContext, bot: Bot):
-    await _search_by_code(message, state, bot)
+# ---------------------------------------------------------------------
+# 8.2  AI QIDIRUV (Instagram Reels / video / skrinshot -> Gemini Vision)
+# ---------------------------------------------------------------------
 
 
-@user_router.message(F.text.regexp(CODE_PATTERN))
-async def search_movie_by_code(message: Message, state: FSMContext, bot: Bot):
-    await _search_by_code(message, state, bot)
+class AIError(Exception):
+    """Foydalanuvchiga ko'rsatiladigan xabarli xatolik."""
+
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
-@user_router.message(F.text)
-async def unknown_text(message: Message):
-    await message.answer(
-        "🤔 Tushunmadim. Kino kodini yuboring (masalan: <code>105</code>) yoki menyudan foydalaning.",
-        reply_markup=main_menu_kb(),
+class MovieGuess(BaseModel):
+    """Gemini javobining tuzilmasi (JSON)."""
+
+    original_title: Optional[str] = None
+    uzbek_title: Optional[str] = None
+    release_year: Optional[int] = None
+    # "high" | "medium" | "low" — model bilmasa to'qib chiqarmasligi uchun
+    confidence: str = "low"
+
+
+GEMINI_PROMPT = (
+    "You are a film expert. The attached images are frames taken from a video clip (or a single screenshot) "
+    "of a movie, TV series or animated film. Identify which movie or series it is.\n"
+    "Use every contextual clue: on-screen text, subtitles, logos, watermarks, distinctive scenes, "
+    "costumes, props, settings and the characters.\n"
+    "Respond ONLY with JSON in exactly this shape:\n"
+    '{"original_title": string|null, "uzbek_title": string|null, "release_year": number|null, '
+    '"confidence": "high"|"medium"|"low"}\n'
+    "Rules:\n"
+    "- original_title: the official original title (usually English).\n"
+    "- uzbek_title: the title as it is commonly known in Uzbekistan (Latin script); if you do not know it, "
+    "repeat the original title.\n"
+    "- release_year: release year of the movie/series, or null.\n"
+    '- confidence: "high" if you are sure, "medium" if it is probable, "low" if you are guessing.\n'
+    "- If you cannot identify it, set both titles and release_year to null and confidence to \"low\". "
+    "Never invent a title."
+)
+
+_ai_busy: set = set()  # hozir AI so'rovi bajarilayotgan foydalanuvchilar (bittadan ortiq parallel so'rov yo'q)
+_ai_sem = asyncio.Semaphore(AI_MAX_PARALLEL)  # yuklash + kadr kesish jarayonlarini cheklaydi (xotira uchun)
+_gemini_client = None
+
+
+def cleanup_stale_tmp() -> None:
+    """Bot qulab tushganda qolib ketgan eski vaqtinchalik papkalarni o'chiradi."""
+    base = tempfile.gettempdir()
+    try:
+        for name in os.listdir(base):
+            if name.startswith("kinobot_"):
+                shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+# --- Og'ir (sinxron) funksiyalar: faqat asyncio.to_thread orqali chaqiriladi ---
+
+
+def _download_reel_sync(url: str, workdir: str) -> str:
+    """Instagram havolasidan videoni workdir ichiga yuklaydi va fayl yo'lini qaytaradi."""
+    try:
+        import yt_dlp
+    except ImportError:
+        raise AIError("⚠️ AI qidiruv hozircha sozlanmagan (yt-dlp o'rnatilmagan).")
+
+    opts: Dict[str, Any] = {
+        "outtmpl": os.path.join(workdir, "reel.%(ext)s"),
+        # Bitta tayyor mp4 fayl (ffmpeg kerak emas), hajmi chegaradan oshmasin
+        "format": f"b[ext=mp4][filesize<?{MAX_REEL_MB}M]/b[ext=mp4]/b",
+        "max_filesize": MAX_REEL_MB * 1024 * 1024,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 20,
+        "retries": 2,
+    }
+    if INSTAGRAM_COOKIES_FILE and os.path.isfile(INSTAGRAM_COOKIES_FILE):
+        opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        logger.warning("Instagramdan yuklab bo'lmadi (%s): %s", url, e)
+        raise AIError(
+            "⚠️ Instagram havolasidan videoni yuklab bo'lmadi (havola yopiq bo'lishi yoki Instagram "
+            "cheklovi bo'lishi mumkin).\nVideoni to'g'ridan-to'g'ri botga yuboring yoki skrinshot tashlang."
+        )
+
+    files = [f for f in os.listdir(workdir) if f.startswith("reel.") and not f.endswith((".part", ".ytdl"))]
+    if not files:
+        raise AIError("⚠️ Videoni yuklab bo'lmadi yoki hajmi juda katta. Skrinshot yuborib ko'ring.")
+    return os.path.join(workdir, files[0])
+
+
+def _encode_frame(frame) -> bytes:
+    """Kadrni (cv2 massivi) uzun tomoni 1024 px dan oshmaydigan JPEG baytlarga aylantiradi."""
+    import cv2
+
+    h, w = frame.shape[:2]
+    scale = 1024 / max(h, w)
+    if scale < 1:
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise AIError("⚠️ Kadrni qayta ishlab bo'lmadi.")
+    return buf.tobytes()
+
+
+def _grab_clean_frame(cap, target: int, total: int) -> Optional[bytes]:
+    """target kadrni o'qiydi; qora/bir xil rangli bo'lsa, yaqin kadrlardan toza birini qidiradi."""
+    import cv2
+
+    fallback: Optional[bytes] = None
+    for offset in (0, 6, -6, 15, -15, 30, -30):
+        idx = target + offset
+        if idx < 0 or idx >= total:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if gray.mean() >= 12 and gray.std() >= 6:  # qora yoki bir tekis kadr emas
+            return _encode_frame(frame)
+        if fallback is None:
+            fallback = _encode_frame(frame)
+    return fallback
+
+
+def _extract_frames_sync(path: str, points: Tuple[float, ...] = (0.2, 0.5, 0.8)) -> List[bytes]:
+    """Videoning 20%, 50% va 80% nuqtalaridan toza kadrlarni JPEG baytlar sifatida qaytaradi."""
+    try:
+        import cv2
+    except ImportError:
+        raise AIError("⚠️ AI qidiruv hozircha sozlanmagan (opencv o'rnatilmagan).")
+
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            raise AIError("⚠️ Videoni o'qib bo'lmadi. Boshqa video yoki skrinshot yuborib ko'ring.")
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:  # ba'zi fayllarda kadrlar soni ko'rsatilmaydi — qo'lda sanaymiz
+            while cap.grab():
+                total += 1
+        if total <= 0:
+            return []
+
+        frames: List[bytes] = []
+        for p in points:
+            target = min(int(total * p), total - 1)
+            jpeg = _grab_clean_frame(cap, target, total)
+            if jpeg:
+                frames.append(jpeg)
+        return frames
+    finally:
+        cap.release()
+
+
+def _read_image_sync(path: str) -> List[bytes]:
+    """Rasmni o'qib, kichraytirilgan JPEG baytlarga aylantiradi."""
+    try:
+        import cv2
+    except ImportError:
+        raise AIError("⚠️ AI qidiruv hozircha sozlanmagan (opencv o'rnatilmagan).")
+    img = cv2.imread(path)
+    if img is None:
+        return []
+    return [_encode_frame(img)]
+
+
+# --- Telegramdan yuklab olish ---
+
+
+async def _download_tg_file(bot: Bot, file_obj: Any, dest: str) -> None:
+    try:
+        await bot.download(file_obj, destination=dest, timeout=120)
+    except TelegramBadRequest as e:
+        if "too big" in str(e).lower():
+            raise AIError(
+                "⚠️ Fayl hajmi 20 MB dan oshmasligi kerak. Qisqaroq video yuboring, skrinshot tashlang "
+                "yoki Instagram havolasini yuboring."
+            )
+        logger.warning("Telegram faylini yuklab bo'lmadi: %s", e)
+        raise AIError("⚠️ Faylni yuklab olib bo'lmadi. Qaytadan urinib ko'ring.")
+    except Exception as e:
+        logger.warning("Telegram faylini yuklab bo'lmadi: %s", e)
+        raise AIError("⚠️ Faylni yuklab olib bo'lmadi. Qaytadan urinib ko'ring.")
+
+
+# --- Gemini ---
+
+
+def _parse_guess_json(text: Optional[str]) -> Optional[MovieGuess]:
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return MovieGuess(**json.loads(match.group(0)))
+    except Exception:
+        return None
+
+
+async def identify_with_gemini(frames: List[bytes]) -> MovieGuess:
+    """Kadrlarni Gemini Vision'ga yuborib, kino nomini JSON ko'rinishida oladi."""
+    global _gemini_client
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError:
+        raise AIError("⚠️ AI qidiruv hozircha sozlanmagan (google-genai o'rnatilmagan).")
+
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+    contents: List[Any] = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in frames]
+    contents.append(GEMINI_PROMPT)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=MovieGuess,
+        temperature=0.1,
     )
+
+    last_error: Optional[BaseException] = None
+    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+        try:
+            response = await asyncio.wait_for(
+                _gemini_client.aio.models.generate_content(model=model, contents=contents, config=config),
+                timeout=90,
+            )
+        except (errors.APIError, asyncio.TimeoutError) as e:
+            # model topilmadi (404), kvota (429), server xatosi yoki vaqt tugashi — keyingi modelni sinaymiz
+            logger.warning("Gemini (%s) xatosi: %r", model, e)
+            last_error = e
+            continue
+
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, MovieGuess):
+            return parsed
+        try:
+            text = response.text
+        except Exception:  # xavfsizlik filtri bloklagan bo'lsa
+            text = None
+        guess = _parse_guess_json(text)
+        if guess is not None:
+            return guess
+        logger.warning("Gemini (%s) javobini o'qib bo'lmadi: %r", model, text)
+
+    logger.error("Gemini barcha modellarda xato berdi: %r", last_error)
+    raise AIError("⚠️ AI xizmati hozir javob bermayapti. Birozdan keyin qayta urinib ko'ring (urinishingiz qaytarildi).")
+
+
+# --- Limit va natija ---
+
+
+async def ai_limit_for(user_id: int) -> Tuple[int, bool]:
+    """(kunlik limit, VIP-mi). Limit 0 bo'lsa — cheksiz. Adminlarga limit yo'q."""
+    if user_id in ADMIN_IDS:
+        return 0, True
+    is_vip = await get_user_referrals(user_id) >= VIP_REFERRAL_COUNT
+    return (AI_DAILY_LIMIT_VIP if is_vip else AI_DAILY_LIMIT_FREE), is_vip
+
+
+async def _limit_reached_text(bot: Bot, user_id: int, limit: int, is_vip: bool) -> str:
+    text = (
+        f"⛔️ <b>Bugungi AI qidiruv limitingiz tugadi</b> ({limit} ta).\n"
+        "Limit har kuni Toshkent vaqti bilan yarim tunda yangilanadi.\n\n"
+    )
+    if not is_vip:
+        me = await bot.me()
+        ref_link = f"https://t.me/{me.username}?start={user_id}"
+        vip_limit = "cheksiz" if AI_DAILY_LIMIT_VIP <= 0 else f"kuniga {AI_DAILY_LIMIT_VIP} ta"
+        text += (
+            f"👑 <b>VIP</b> bo'lish uchun {VIP_REFERRAL_COUNT} ta do'stingizni taklif qiling — "
+            f"VIP foydalanuvchilarga AI qidiruv {vip_limit} beriladi va VIP kinolar ochiladi.\n"
+            f"🔗 Sizning havolangiz:\n<code>{ref_link}</code>\n\n"
+        )
+    text += "Hozircha kinoni <b>kodi</b> yoki <b>nomi</b> bilan qidirishingiz mumkin."
+    return text
+
+
+def _guess_titles(guess: MovieGuess) -> List[str]:
+    """Bo'sh bo'lmagan, takrorlanmagan nomlar ro'yxati (original, keyin o'zbekcha)."""
+    titles: List[str] = []
+    for t in (guess.original_title, guess.uzbek_title):
+        t = (t or "").strip()
+        if t and t.casefold() not in [x.casefold() for x in titles]:
+            titles.append(t)
+    return titles
+
+
+async def _deliver_ai_result(message: Message, bot: Bot, guess: MovieGuess, remaining_line: str) -> None:
+    titles = _guess_titles(guess)
+    confidence = (guess.confidence or "low").strip().lower()
+
+    if not titles or confidence not in ("high", "medium"):
+        await message.answer(
+            "🤔 <b>Kinoni aniqlab bo'lmadi.</b>\n"
+            "Yuzi va yozuvlari aniq ko'ringan boshqa kadr/skrinshot yuboring yoki kino kodini/nomini kiriting."
+            f"{remaining_line}"
+        )
+        return
+
+    year = guess.release_year
+    year_part = f" ({year})" if isinstance(year, int) and 1888 <= year <= datetime.now().year + 2 else ""
+    label = "Aniqlandi" if confidence == "high" else "Taxminan aniqlandi"
+    header = f"🎬 <b>{label}:</b> {esc(' / '.join(titles))}{year_part}"
+
+    found = await search_movies_multi(titles)
+    if not found:
+        await message.answer(
+            f"{header}\nℹ️ Ushbu film hozircha bazamizda mavjud emas, lekin adminlar tez orada qo'shishadi!"
+            f"{remaining_line}"
+        )
+    elif len(found) == 1:
+        await message.answer(f"{header}{remaining_line}")
+        await send_movie_helper(message, found[0], bot, message.from_user.id)
+    else:
+        await message.answer(
+            f"{header}\n\n🔎 Bazadan o'xshash kinolar topildi, keraklisini tanlang:{remaining_line}",
+            reply_markup=search_results_kb(found),
+        )
+
+
+async def run_ai_search(message: Message, bot: Bot, kind: str, source: Any) -> None:
+    """kind: 'reel' (source — havola matni) | 'video' | 'photo' (source — Telegram fayl obyekti)."""
+    user_id = message.from_user.id
+
+    if not GEMINI_API_KEY:
+        await message.answer("⚠️ AI qidiruv hozircha sozlanmagan. Kino kodini yoki nomini yuboring.")
+        return
+    if not await require_subscription(message, bot, "❗️ AI qidiruvdan oldin kanallarga obuna bo'ling:"):
+        return
+
+    if kind in ("video", "photo"):
+        size = getattr(source, "file_size", None)
+        if size and size > MAX_TG_DOWNLOAD:
+            await message.answer(
+                "⚠️ Fayl hajmi 20 MB dan oshmasligi kerak. Qisqaroq video yuboring, skrinshot tashlang "
+                "yoki Instagram havolasini yuboring."
+            )
+            return
+
+    # tekshirish va qo'shish orasida await yo'q — parallel so'rovlar o'tib ketmaydi
+    if user_id in _ai_busy:
+        await message.answer("⏳ Oldingi so'rovingiz hali ishlanmoqda, bir oz kuting.")
+        return
+    _ai_busy.add(user_id)
+
+    workdir: Optional[str] = None
+    status: Optional[Message] = None
+    refundable = False  # Gemini javob bermaguncha texnik xato bo'lsa, urinish qaytariladi
+    try:
+        limit, is_vip = await ai_limit_for(user_id)
+        allowed, used = await try_consume_ai(user_id, limit)
+        if not allowed:
+            await message.answer(await _limit_reached_text(bot, user_id, limit, is_vip))
+            return
+        refundable = True
+
+        status = await message.answer("🔎 Tahlil qilinmoqda, bir necha soniya kuting...")
+        workdir = await asyncio.to_thread(tempfile.mkdtemp, prefix="kinobot_")
+
+        # Og'ir ishlar (yuklash, kadr kesish) — bir vaqtda AI_MAX_PARALLEL tadan ko'p emas
+        async with _ai_sem:
+            if kind == "reel":
+                path = await asyncio.to_thread(_download_reel_sync, source, workdir)
+                frames = await asyncio.to_thread(_extract_frames_sync, path)
+            elif kind == "video":
+                path = os.path.join(workdir, "input.mp4")
+                await _download_tg_file(bot, source, path)
+                frames = await asyncio.to_thread(_extract_frames_sync, path)
+            else:
+                path = os.path.join(workdir, "input.jpg")
+                await _download_tg_file(bot, source, path)
+                frames = await asyncio.to_thread(_read_image_sync, path)
+
+        if not frames:
+            raise AIError("⚠️ Videodan kadrlarni ajratib bo'lmadi. Boshqa video yoki skrinshot yuborib ko'ring.")
+
+        guess = await identify_with_gemini(frames)
+        refundable = False  # Gemini javob berdi — urinish sarflandi
+
+        remaining_line = ""
+        if limit > 0:
+            remaining_line = f"\n\n🤖 Bugungi qolgan AI qidiruv: <b>{max(limit - used, 0)} / {limit}</b>"
+        await _deliver_ai_result(message, bot, guess, remaining_line)
+
+    except AIError as e:
+        if refundable:
+            await refund_ai(user_id)
+        await message.answer(e.user_message)
+    except Exception:
+        logger.exception("AI qidiruvda kutilmagan xatolik")
+        if refundable:
+            await refund_ai(user_id)
+        try:
+            await message.answer("⚠️ Kutilmagan xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring.")
+        except Exception:
+            pass
+    finally:
+        _ai_busy.discard(user_id)
+        # Muvaffaqiyatli yoki xato — vaqtinchalik fayllar har doim diskdan o'chiriladi
+        if workdir:
+            await asyncio.to_thread(shutil.rmtree, workdir, True)
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+
+def _is_ig_link(message: Message) -> bool:
+    return bool(message.text and IG_URL_RE.search(message.text))
+
+
+# Foydalanuvchi oddiy holatda yoki "kod kutilmoqda" holatida bo'lsa ishlaydi
+# (admin FSM jarayonlariga xalaqit bermaslik uchun).
+_USER_STATES = StateFilter(None, UserStates.waiting_for_code)
+
+
+@user_router.message(_USER_STATES, _is_ig_link)
+async def ai_from_reel(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    url = IG_URL_RE.search(message.text).group(0)
+    await run_ai_search(message, bot, "reel", url)
+
+
+@user_router.message(_USER_STATES, F.video | F.video_note | F.animation)
+async def ai_from_video(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    media = message.video or message.video_note or message.animation
+    await run_ai_search(message, bot, "video", media)
+
+
+@user_router.message(_USER_STATES, F.photo)
+async def ai_from_photo(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await run_ai_search(message, bot, "photo", message.photo[-1])
+
+
+# Tartib muhim: yuqoridagi menyu tugmalari va AI handlerlari avval tekshiriladi, bu esa eng oxirida.
+@user_router.message(_USER_STATES, F.text)
+async def search_by_text(message: Message, state: FSMContext, bot: Bot):
+    await _search_text(message, state, bot)
 
 
 # =====================================================================
@@ -1410,7 +2139,10 @@ async def main():
         raise SystemExit("BOT_TOKEN topilmadi! Railway > Variables bo'limiga BOT_TOKEN qo'shing.")
     if not ADMIN_IDS:
         logger.warning("ADMIN_IDS bo'sh — admin panel hech kimga ochilmaydi!")
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY yo'q — AI qidiruv o'chirilgan (nom/kod bo'yicha qidiruv ishlaydi).")
 
+    cleanup_stale_tmp()
     await init_db()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
