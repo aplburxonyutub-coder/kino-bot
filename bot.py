@@ -83,6 +83,7 @@ MAX_REEL_MB = int(os.getenv("MAX_REEL_MB", "50"))  # Instagram videosi uchun mak
 # Instagram ko'p hollarda serverlardan kirishni bloklaydi. Kerak bo'lsa cookies.txt (Netscape format) yo'li:
 INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip()
 MAX_TG_DOWNLOAD = 20 * 1024 * 1024  # Telegram Bot API faqat 20 MB gacha faylni yuklab berishga ruxsat beradi
+ALL_MOVIES_PAGE_SIZE = 20  # "Barcha kinolar" ro'yxatida bir sahifadagi kinolar soni
 SEARCH_RESULTS_LIMIT = 8  # nom bo'yicha qidiruvda ko'rsatiladigan maksimal tugmalar soni
 
 # Kunlik limit O'zbekiston vaqti (UTC+5) bilan yangilanadi (Railway serveri UTC'da ishlaydi)
@@ -405,6 +406,20 @@ async def search_movies_multi(queries: List[str], limit: int = SEARCH_RESULTS_LI
     return out[:limit]
 
 
+async def count_movies() -> int:
+    cur = await _db.execute("SELECT COUNT(*) FROM movies")
+    return (await cur.fetchone())[0]
+
+
+async def get_movies_page(offset: int, limit: int) -> List[tuple]:
+    """(kod, sarlavha, VIP) — eng ko'p ko'rilganlar yuqorida."""
+    cur = await _db.execute(
+        "SELECT code, title, is_vip FROM movies ORDER BY views DESC, code LIMIT ? OFFSET ?",
+        (limit, offset),
+    )
+    return await cur.fetchall()
+
+
 async def set_poster(code: str, poster_id: Optional[str]) -> None:
     async with _db_lock:
         await _db.execute("UPDATE movies SET poster_id = ? WHERE code = ?", (poster_id, code))
@@ -622,6 +637,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🎬 Kino qidirish"), KeyboardButton(text="🎲 Tasodifiy kino")],
             [KeyboardButton(text="👑 VIP holat"), KeyboardButton(text="🏆 Top kinolar")],
+            [KeyboardButton(text="📚 Barcha kinolar")],
         ],
         resize_keyboard=True,
     )
@@ -680,6 +696,18 @@ def search_results_kb(movies: List[Movie]) -> InlineKeyboardMarkup:
         label = ("👑 " if is_vip else "🎬 ") + _first_line(title, 50)
         rows.append([InlineKeyboardButton(text=label, callback_data=f"movie:{code}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def all_movies_kb(page: int, pages: int) -> Optional[InlineKeyboardMarkup]:
+    if pages <= 1:
+        return None
+    row = []
+    if page > 1:
+        row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"list:{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"{page} / {pages}", callback_data="list:noop"))
+    if page < pages:
+        row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"list:{page + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def more_parts_kb() -> InlineKeyboardMarkup:
@@ -1521,6 +1549,48 @@ async def menu_top_movies(message: Message, state: FSMContext, bot: Bot):
 
     text += "\n💡 <i>Kino kodini nusxalab botga yuboring!</i>"
     await message.answer(text)
+
+
+async def _all_movies_page(page: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    total = await count_movies()
+    if total == 0:
+        return "📭 Hozircha bazada kinolar mavjud emas.", None
+    pages = max(1, -(-total // ALL_MOVIES_PAGE_SIZE))
+    page = min(max(page, 1), pages)
+    rows = await get_movies_page((page - 1) * ALL_MOVIES_PAGE_SIZE, ALL_MOVIES_PAGE_SIZE)
+    lines = [f"📚 <b>Barcha kinolar</b> (jami: {total} ta)\n"]
+    start = (page - 1) * ALL_MOVIES_PAGE_SIZE
+    for i, (code, title, is_vip) in enumerate(rows, start + 1):
+        vip = "👑 " if is_vip else ""
+        lines.append(f"{i}. {vip}<b>{esc(_first_line(title, 50))}</b> — Kod: <code>{esc(code)}</code>")
+    lines.append("\n💡 <i>Kino kodini nusxalab botga yuboring!</i>")
+    return "\n".join(lines), all_movies_kb(page, pages)
+
+
+@user_router.message(F.text == "📚 Barcha kinolar")
+async def menu_all_movies(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    if not await require_subscription(message, bot):
+        return
+    text, kb = await _all_movies_page(1)
+    await message.answer(text, reply_markup=kb)
+
+
+@user_router.callback_query(F.data.startswith("list:"))
+async def handle_all_movies_page(callback: CallbackQuery, bot: Bot):
+    arg = callback.data.split(":", 1)[1]
+    if not arg.isdigit():  # "noop" — sahifa raqami tugmasi
+        await callback.answer()
+        return
+    if await get_unsubscribed_channels(bot, callback.from_user.id):
+        await callback.answer("❗️ Avval kanallarga obuna bo'ling va /start bosing.", show_alert=True)
+        return
+    text, kb = await _all_movies_page(int(arg))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # "message is not modified"
+    await callback.answer()
 
 
 @user_router.callback_query(F.data.startswith("part:"))
